@@ -1,0 +1,324 @@
+#!/bin/bash
+# conv — manage the conversations database
+# Usage:
+#   conv add -s "summary" [-p project] [-t topics] [-d decisions] [-o outcomes] [-c context] [-m mins] [--date YYYY-MM-DD]
+#   conv backfill [--dry-run]   — reconstruct unlogged sessions from git + breadcrumbs
+#   conv search "query"         — full-text search
+#   conv list [n]               — show last n conversations (default 10)
+#   conv show <id>              — show full conversation record
+#   conv project <name>         — list conversations for a project
+#   conv today                  — show today's conversations
+#   conv stats                  — summary statistics
+#   conv gaps                   — show days with git activity but no logged conversation
+
+SCRIPT="$0"
+[ -L "$SCRIPT" ] && SCRIPT="$(readlink "$SCRIPT")"
+DB_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+DB="$DB_DIR/conversations.db"
+CLAUDE_DIR="$HOME/claude"
+DIARY_DIR="$HOME/.claude/diary"
+
+# Initialize DB if needed
+if [ ! -f "$DB" ]; then
+  sqlite3 "$DB" < "$DB_DIR/schema.sql"
+  echo "Database initialized at $DB"
+fi
+
+# Helper: escape single quotes for SQL
+sql_escape() {
+  echo "$1" | sed "s/'/''/g"
+}
+
+# Helper: insert a conversation (used by add and backfill)
+insert_conv() {
+  local date="$1" time_start="$2" project="$3" summary="$4" topics="$5" decisions="$6" outcomes="$7" context="$8" duration="$9"
+
+  sqlite3 "$DB" "INSERT INTO conversations (date, time_start, project, summary, topics, decisions, outcomes, context, duration_mins)
+    VALUES (
+      '$date',
+      $([ -z "$time_start" ] && echo "NULL" || echo "'$time_start'"),
+      $([ -z "$project" ] && echo "NULL" || echo "'$(sql_escape "$project")'"),
+      '$(sql_escape "$summary")',
+      $([ -z "$topics" ] && echo "NULL" || echo "'$(sql_escape "$topics")'"),
+      $([ -z "$decisions" ] && echo "NULL" || echo "'$(sql_escape "$decisions")'"),
+      $([ -z "$outcomes" ] && echo "NULL" || echo "'$(sql_escape "$outcomes")'"),
+      $([ -z "$context" ] && echo "NULL" || echo "'$(sql_escape "$context")'"),
+      $([ -z "$duration" ] && echo "NULL" || echo "$duration")
+    );"
+}
+
+case "${1:-list}" in
+  add)
+    shift
+    DATE=$(date +%Y-%m-%d)
+    TIME_START=$(date +%H:%M)
+    PROJECT=""
+    SUMMARY=""
+    TOPICS=""
+    DECISIONS=""
+    OUTCOMES=""
+    CONTEXT=""
+    DURATION=""
+
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -p) PROJECT="$2"; shift 2 ;;
+        -s) SUMMARY="$2"; shift 2 ;;
+        -t) TOPICS="$2"; shift 2 ;;
+        -d) DECISIONS="$2"; shift 2 ;;
+        -o) OUTCOMES="$2"; shift 2 ;;
+        -c) CONTEXT="$2"; shift 2 ;;
+        -m) DURATION="$2"; shift 2 ;;
+        --date) DATE="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+
+    if [ -z "$SUMMARY" ]; then
+      echo "Error: summary is required (-s \"...\")"
+      exit 1
+    fi
+
+    insert_conv "$DATE" "$TIME_START" "$PROJECT" "$SUMMARY" "$TOPICS" "$DECISIONS" "$OUTCOMES" "$CONTEXT" "$DURATION"
+    echo "Conversation logged (#$(sqlite3 "$DB" "SELECT max(id) FROM conversations;"))"
+    ;;
+
+  backfill)
+    shift
+    DRY_RUN=0
+    [ "$1" = "--dry-run" ] && DRY_RUN=1
+
+    TODAY=$(date +%Y-%m-%d)
+    BACKFILLED=0
+
+    # Scan last 60 days, skip already-logged dates
+    START=$(date -v-60d +%Y-%m-%d 2>/dev/null || date -d "60 days ago" +%Y-%m-%d)
+    CURRENT="$START"
+
+    while true; do
+      # Advance one day
+      CURRENT=$(date -j -f %Y-%m-%d -v+1d "$CURRENT" +%Y-%m-%d 2>/dev/null || date -d "$CURRENT + 1 day" +%Y-%m-%d)
+
+      # Stop at today (today's session is still in progress)
+      [ "$CURRENT" = "$TODAY" ] && break
+      [ "$CURRENT" \> "$TODAY" ] && break
+
+      # Skip if already logged
+      EXISTING=$(sqlite3 "$DB" "SELECT count(*) FROM conversations WHERE date = '$CURRENT';")
+      [ "$EXISTING" -gt 0 ] && continue
+
+      # Collect git activity for this day
+      DAY_SUMMARY=""
+      DAY_PROJECTS=""
+
+      for repo_dir in "$CLAUDE_DIR"/*/; do
+        [ ! -d "$repo_dir/.git" ] && continue
+        repo_name=$(basename "$repo_dir")
+
+        # Get commits for this day
+        COMMITS=$(cd "$repo_dir" && git log --oneline --since="${CURRENT}T00:00:00" --until="${CURRENT}T23:59:59" 2>/dev/null)
+        if [ -n "$COMMITS" ]; then
+          COMMIT_COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
+          FIRST_COMMIT_TIME=$(cd "$repo_dir" && git log --format="%H" --since="${CURRENT}T00:00:00" --until="${CURRENT}T23:59:59" 2>/dev/null | tail -1 | xargs -I{} git show -s --format="%H %ai" {} 2>/dev/null | awk '{print $2}' | cut -d'T' -f2 | cut -c1-5)
+          DAY_SUMMARY="${DAY_SUMMARY}${repo_name} (${COMMIT_COUNT} commits): $(echo "$COMMITS" | head -5 | tr '\n' '; ')\n"
+          if [ -z "$DAY_PROJECTS" ]; then
+            DAY_PROJECTS="$repo_name"
+          else
+            DAY_PROJECTS="${DAY_PROJECTS},${repo_name}"
+          fi
+        fi
+      done
+
+      # Check for breadcrumbs
+      BREADCRUMB=""
+      BREADCRUMB_FILE="$DIARY_DIR/breadcrumbs/${CURRENT}.md"
+      if [ -f "$BREADCRUMB_FILE" ]; then
+        BREADCRUMB=$(cat "$BREADCRUMB_FILE")
+      fi
+
+      # Check for diary entry (extra context)
+      DIARY=""
+      DIARY_FILE="$DIARY_DIR/entries/${CURRENT}.md"
+      if [ -f "$DIARY_FILE" ]; then
+        DIARY=$(cat "$DIARY_FILE")
+      fi
+
+      # Skip days with no activity
+      [ -z "$DAY_SUMMARY" ] && [ -z "$BREADCRUMB" ] && continue
+
+      # Build the summary
+      SUMMARY=""
+      if [ -n "$DIARY" ]; then
+        # Extract summary line from diary if available
+        DIARY_SUMMARY=$(echo "$DIARY" | grep -A1 "## Summary" | tail -1 | sed 's/^[[:space:]]*//')
+        [ -n "$DIARY_SUMMARY" ] && SUMMARY="$DIARY_SUMMARY"
+      fi
+
+      if [ -z "$SUMMARY" ]; then
+        # Build from git data
+        SUMMARY="Work on ${DAY_PROJECTS}: $(echo -e "$DAY_SUMMARY" | head -3 | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+      fi
+
+      # Determine primary project (most commits)
+      PRIMARY_PROJECT=""
+      if [ -n "$DAY_PROJECTS" ]; then
+        # Use first project if only one, otherwise leave multi
+        PROJ_COUNT=$(echo "$DAY_PROJECTS" | tr ',' '\n' | wc -l | tr -d ' ')
+        if [ "$PROJ_COUNT" -eq 1 ]; then
+          PRIMARY_PROJECT="$DAY_PROJECTS"
+        fi
+      fi
+
+      # Build outcomes from git
+      OUTCOMES=$(echo -e "$DAY_SUMMARY" | sed 's/\\n/\n/g' | head -10)
+
+      # Build context from breadcrumbs
+      CTX="$BREADCRUMB"
+
+      if [ "$DRY_RUN" -eq 1 ]; then
+        echo "Would backfill $CURRENT:"
+        echo "  project: ${PRIMARY_PROJECT:-(multiple: $DAY_PROJECTS)}"
+        echo "  summary: $SUMMARY"
+        echo "  topics: $DAY_PROJECTS"
+        echo ""
+      else
+        insert_conv "$CURRENT" "" "$PRIMARY_PROJECT" "$SUMMARY" "$DAY_PROJECTS" "" "$OUTCOMES" "$CTX" ""
+        BACKFILLED=$((BACKFILLED + 1))
+        echo "Backfilled $CURRENT — ${DAY_PROJECTS}"
+      fi
+    done
+
+    if [ "$DRY_RUN" -eq 0 ]; then
+      if [ "$BACKFILLED" -gt 0 ]; then
+        echo "Backfilled $BACKFILLED session(s)"
+        # Auto-commit
+        cd "$DB_DIR" && git add conversations.db && git commit -m "backfill: $BACKFILLED session(s) through $(date -v-1d +%Y-%m-%d 2>/dev/null || date -d yesterday +%Y-%m-%d)" --quiet 2>/dev/null
+      else
+        echo "Nothing to backfill — all caught up"
+      fi
+    fi
+    ;;
+
+  gaps)
+    echo "=== Days with git activity but no conversation log ==="
+    echo ""
+
+    # Check last 60 days
+    for i in $(seq 60 -1 1); do
+      DAY=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "$i days ago" +%Y-%m-%d)
+
+      # Check if logged
+      LOGGED=$(sqlite3 "$DB" "SELECT count(*) FROM conversations WHERE date = '$DAY';")
+      [ "$LOGGED" -gt 0 ] && continue
+
+      # Check git activity
+      HAS_ACTIVITY=0
+      ACTIVE_REPOS=""
+      for repo_dir in "$CLAUDE_DIR"/*/; do
+        [ ! -d "$repo_dir/.git" ] && continue
+        COMMITS=$(cd "$repo_dir" && git log --oneline --since="${DAY}T00:00:00" --until="${DAY}T23:59:59" 2>/dev/null)
+        if [ -n "$COMMITS" ]; then
+          HAS_ACTIVITY=1
+          repo_name=$(basename "$repo_dir")
+          count=$(echo "$COMMITS" | wc -l | tr -d ' ')
+          ACTIVE_REPOS="${ACTIVE_REPOS} ${repo_name}(${count})"
+        fi
+      done
+
+      # Check breadcrumbs
+      [ -f "$DIARY_DIR/breadcrumbs/${DAY}.md" ] && HAS_ACTIVITY=1
+
+      [ "$HAS_ACTIVITY" -eq 1 ] && echo "$DAY —$ACTIVE_REPOS"
+    done
+    ;;
+
+  search)
+    shift
+    QUERY="$1"
+    if [ -z "$QUERY" ]; then
+      echo "Usage: conv search \"query\""
+      exit 1
+    fi
+    sqlite3 -header -column "$DB" \
+      "SELECT c.id, c.date, c.project, c.summary
+       FROM conversations c
+       JOIN conversations_fts f ON c.id = f.rowid
+       WHERE conversations_fts MATCH '$(sql_escape "$QUERY")'
+       ORDER BY c.date DESC;"
+    ;;
+
+  list)
+    shift
+    N="${1:-10}"
+    sqlite3 -header -column "$DB" \
+      "SELECT id, date, project, substr(summary, 1, 80) as summary
+       FROM conversations ORDER BY date DESC, id DESC LIMIT $N;"
+    ;;
+
+  show)
+    shift
+    ID="$1"
+    if [ -z "$ID" ]; then
+      echo "Usage: conv show <id>"
+      exit 1
+    fi
+    sqlite3 -header -column "$DB" \
+      "SELECT * FROM conversations WHERE id = $ID;"
+    ;;
+
+  project)
+    shift
+    NAME="$1"
+    if [ -z "$NAME" ]; then
+      echo "Usage: conv project <name>"
+      exit 1
+    fi
+    sqlite3 -header -column "$DB" \
+      "SELECT id, date, substr(summary, 1, 80) as summary
+       FROM conversations WHERE project = '$NAME'
+       ORDER BY date DESC;"
+    ;;
+
+  today)
+    DATE=$(date +%Y-%m-%d)
+    sqlite3 -header -column "$DB" \
+      "SELECT id, time_start, project, summary
+       FROM conversations WHERE date = '$DATE'
+       ORDER BY id;"
+    ;;
+
+  stats)
+    echo "=== Conversation Stats ==="
+    echo ""
+    echo "Total conversations:"
+    sqlite3 "$DB" "SELECT count(*) FROM conversations;"
+    echo ""
+    echo "By project:"
+    sqlite3 -header -column "$DB" \
+      "SELECT coalesce(project, '(general)') as project, count(*) as count
+       FROM conversations GROUP BY project ORDER BY count DESC;"
+    echo ""
+    echo "By month:"
+    sqlite3 -header -column "$DB" \
+      "SELECT substr(date, 1, 7) as month, count(*) as count
+       FROM conversations GROUP BY month ORDER BY month DESC LIMIT 6;"
+    echo ""
+    echo "Date range:"
+    sqlite3 "$DB" "SELECT min(date) || ' → ' || max(date) FROM conversations;"
+    ;;
+
+  *)
+    echo "Usage: conv {add|backfill|search|list|show|project|today|gaps|stats}"
+    echo ""
+    echo "Commands:"
+    echo "  add -s \"summary\" [-p project] [-t topics] [-d decisions] [-o outcomes] [-c context] [-m mins] [--date YYYY-MM-DD]"
+    echo "  backfill [--dry-run]  Reconstruct unlogged sessions from git + breadcrumbs"
+    echo "  search \"query\"        Full-text search across all fields"
+    echo "  list [n]              Show last n conversations (default 10)"
+    echo "  show <id>             Show full conversation record"
+    echo "  project <name>        List conversations for a project"
+    echo "  today                 Show today's conversations"
+    echo "  gaps                  Show days with git activity but no log"
+    echo "  stats                 Summary statistics"
+    ;;
+esac
