@@ -15,7 +15,7 @@ echo "  bin dir:       $BIN_DIR"
 echo ""
 
 # Requirements check
-for cmd in bash sqlite3 git; do
+for cmd in bash sqlite3 git python3; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "Error: required command '$cmd' not found in PATH."
     exit 1
@@ -32,11 +32,21 @@ echo "✓ commands installed"
 mkdir -p "$CLAUDE_HOME/diary/entries" "$CLAUDE_HOME/diary/breadcrumbs"
 echo "✓ diary directories created"
 
-# 3. conv CLI
+# 3. conv CLI + its support files
+# conv lives alongside its database so it can find the schema files and the
+# transcripts DB ($DB_DIR resolves to the script's own dir). bin/conv is a
+# symlink into the conversations dir.
+CONV_DIR="$CLAUDE_WORK/conversations"
+mkdir -p "$CONV_DIR"
+cp "$REPO_DIR/bin/conv"               "$CONV_DIR/conv"
+cp "$REPO_DIR/schema.sql"             "$CONV_DIR/schema.sql"
+cp "$REPO_DIR/schema-transcripts.sql" "$CONV_DIR/schema-transcripts.sql"
+cp "$REPO_DIR/ingest.py"              "$CONV_DIR/ingest.py"
+chmod +x "$CONV_DIR/conv"
+
 mkdir -p "$BIN_DIR"
-cp "$REPO_DIR/bin/conv" "$BIN_DIR/conv"
-chmod +x "$BIN_DIR/conv"
-echo "✓ conv installed to $BIN_DIR"
+ln -sf "$CONV_DIR/conv" "$BIN_DIR/conv"
+echo "✓ conv installed (symlinked $BIN_DIR/conv → $CONV_DIR/conv)"
 
 if ! echo ":$PATH:" | grep -q ":$BIN_DIR:"; then
   echo ""
@@ -44,21 +54,27 @@ if ! echo ":$PATH:" | grep -q ":$BIN_DIR:"; then
   echo "     export PATH=\"$BIN_DIR:\$PATH\""
 fi
 
-# 4. Conversations DB (git-backed)
-CONV_DIR="$CLAUDE_WORK/conversations"
-if [ ! -d "$CONV_DIR" ]; then
-  mkdir -p "$CONV_DIR"
-  cp "$REPO_DIR/schema.sql" "$CONV_DIR/schema.sql"
+# 4. Databases — git-backed summary ledger + gitignored verbatim transcripts
+if [ ! -f "$CONV_DIR/conversations.db" ]; then
   sqlite3 "$CONV_DIR/conversations.db" < "$CONV_DIR/schema.sql"
+  sqlite3 "$CONV_DIR/transcripts.db"   < "$CONV_DIR/schema-transcripts.sql"
   cd "$CONV_DIR"
   git init -q
-  echo "conversations.db-journal" > .gitignore
+  cat > .gitignore <<'GI'
+conversations.db-journal
+conversations.db-wal
+conversations.db-shm
+# Verbatim transcripts are bulky — rebuildable anytime via `conv ingest`.
+transcripts.db
+transcripts.db-wal
+transcripts.db-shm
+GI
   git add -A
   git commit -q -m "init: conversations db"
   cd - >/dev/null
-  echo "✓ conversations db initialized at $CONV_DIR"
+  echo "✓ conversations + transcripts dbs initialized at $CONV_DIR"
 else
-  echo "• conversations dir exists — skipping init"
+  echo "• conversations dir exists — refreshed conv/schema/ingest, skipped db init"
 fi
 
 # 5. Build logs (git-backed, empty)

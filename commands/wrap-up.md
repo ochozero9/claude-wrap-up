@@ -36,7 +36,13 @@ Fill in from session context:
 - `-d` — key decisions made (omit if none)
 - `-o` — what was accomplished
 
-Then commit:
+Then ingest verbatim transcripts (idempotent — pulls this session and any
+stragglers into the gitignored transcripts.db before they could age out):
+```bash
+conv ingest
+```
+
+Then commit (summary ledger only — transcripts.db is gitignored, so this is safe):
 ```bash
 cd ~/claude/conversations && git add -A && git commit -m "log: $(date +%Y-%m-%d) session"
 ```

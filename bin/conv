@@ -3,25 +3,34 @@
 # Usage:
 #   conv add -s "summary" [-p project] [-t topics] [-d decisions] [-o outcomes] [-c context] [-m mins] [--date YYYY-MM-DD]
 #   conv backfill [--dry-run]   — reconstruct unlogged sessions from git + breadcrumbs
-#   conv search "query"         — full-text search
+#   conv search "query"         — full-text search of summary fields
 #   conv list [n]               — show last n conversations (default 10)
 #   conv show <id>              — show full conversation record
 #   conv project <name>         — list conversations for a project
 #   conv today                  — show today's conversations
 #   conv stats                  — summary statistics
 #   conv gaps                   — show days with git activity but no logged conversation
+#   conv ingest [path]          — load verbatim transcripts from Claude Code JSONL logs
+#   conv sessions [n]           — list recently-ingested sessions
+#   conv transcript <sid>       — show a session's verbatim turns in order
+#   conv msearch "query"        — full-text search of verbatim transcripts
 
 SCRIPT="$0"
 [ -L "$SCRIPT" ] && SCRIPT="$(readlink "$SCRIPT")"
 DB_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
-DB="$DB_DIR/conversations.db"
+DB="$DB_DIR/conversations.db"          # summary ledger (git-tracked)
+TDB="$DB_DIR/transcripts.db"           # verbatim transcripts (gitignored — see .gitignore)
 CLAUDE_DIR="$HOME/claude"
 DIARY_DIR="$HOME/.claude/diary"
 
-# Initialize DB if needed
+# Initialize DBs if needed
 if [ ! -f "$DB" ]; then
   sqlite3 "$DB" < "$DB_DIR/schema.sql"
   echo "Database initialized at $DB"
+fi
+if [ ! -f "$TDB" ]; then
+  sqlite3 "$TDB" < "$DB_DIR/schema-transcripts.sql"
+  echo "Transcripts database initialized at $TDB"
 fi
 
 # Helper: escape single quotes for SQL
@@ -199,6 +208,53 @@ case "${1:-list}" in
     fi
     ;;
 
+  ingest)
+    shift
+    PATH_ARG="$1"   # optional: a .jsonl file or a directory; defaults inside ingest.py
+    python3 "$DB_DIR/ingest.py" "$TDB" "$DB" ${PATH_ARG:+"$PATH_ARG"}
+    ;;
+
+  transcript)
+    shift
+    SID="$1"
+    if [ -z "$SID" ]; then
+      echo "Usage: conv transcript <session_id>   (see 'conv sessions' for IDs)"
+      exit 1
+    fi
+    sqlite3 -header -column "$TDB" \
+      "SELECT seq, timestamp, role, substr(content, 1, 200) AS content
+       FROM messages WHERE session_id = '$(sql_escape "$SID")'
+       ORDER BY seq;"
+    ;;
+
+  sessions)
+    shift
+    N="${1:-20}"
+    sqlite3 -header -column "$TDB" \
+      "SELECT session_id,
+              coalesce(project, '(general)') AS project,
+              substr(min(timestamp), 1, 16) AS started,
+              count(*) AS msgs
+       FROM messages
+       GROUP BY session_id
+       ORDER BY started DESC LIMIT $N;"
+    ;;
+
+  msearch)
+    shift
+    QUERY="$1"
+    if [ -z "$QUERY" ]; then
+      echo "Usage: conv msearch \"query\"   (full-text search of verbatim transcripts)"
+      exit 1
+    fi
+    sqlite3 -header -column "$TDB" \
+      "SELECT m.session_id, m.timestamp, m.role, substr(m.content, 1, 120) AS content
+       FROM messages m
+       JOIN messages_fts f ON m.id = f.rowid
+       WHERE messages_fts MATCH '$(sql_escape "$QUERY")'
+       ORDER BY m.timestamp DESC LIMIT 50;"
+    ;;
+
   gaps)
     echo "=== Days with git activity but no conversation log ==="
     echo ""
@@ -308,17 +364,23 @@ case "${1:-list}" in
     ;;
 
   *)
-    echo "Usage: conv {add|backfill|search|list|show|project|today|gaps|stats}"
+    echo "Usage: conv {add|backfill|ingest|search|msearch|list|sessions|show|transcript|project|today|gaps|stats}"
     echo ""
-    echo "Commands:"
+    echo "Summary ledger (human-curated):"
     echo "  add -s \"summary\" [-p project] [-t topics] [-d decisions] [-o outcomes] [-c context] [-m mins] [--date YYYY-MM-DD]"
     echo "  backfill [--dry-run]  Reconstruct unlogged sessions from git + breadcrumbs"
-    echo "  search \"query\"        Full-text search across all fields"
+    echo "  search \"query\"        Full-text search across summary fields"
     echo "  list [n]              Show last n conversations (default 10)"
     echo "  show <id>             Show full conversation record"
     echo "  project <name>        List conversations for a project"
     echo "  today                 Show today's conversations"
     echo "  gaps                  Show days with git activity but no log"
     echo "  stats                 Summary statistics"
+    echo ""
+    echo "Verbatim transcripts (ingested from Claude Code JSONL):"
+    echo "  ingest [path]         Load new turns from ~/.claude/projects (or a file/dir)"
+    echo "  sessions [n]          List recently-ingested sessions"
+    echo "  transcript <sid>      Show a session's turns in order"
+    echo "  msearch \"query\"       Full-text search across verbatim transcripts"
     ;;
 esac
