@@ -20,8 +20,8 @@ SCRIPT="$0"
 DB_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
 DB="$DB_DIR/conversations.db"          # summary ledger (git-tracked)
 TDB="$DB_DIR/transcripts.db"           # verbatim transcripts (gitignored — see .gitignore)
-CLAUDE_DIR="$HOME/claude"
-DIARY_DIR="$HOME/.claude/diary"
+CLAUDE_DIR="${WRAP_UP_WORK_DIR:-$PWD}"
+DIARY_DIR="${WRAP_UP_DIARY_DIR:-$HOME/.local/share/agent-wrap-up/diary}"
 
 # Initialize DBs if needed
 if [ ! -f "$DB" ]; then
@@ -378,7 +378,7 @@ case "${1:-list}" in
     echo "  stats                 Summary statistics"
     echo ""
     echo "Verbatim transcripts (ingested from Claude Code JSONL):"
-    echo "  ingest [path]         Load new turns from ~/.claude/projects (or a file/dir)"
+    echo "  ingest [path]         Load new turns from the configured source (or a file/dir)"
     echo "  sessions [n]          List recently-ingested sessions"
     echo "  transcript <sid>      Show a session's turns in order"
     echo "  msearch \"query\"       Full-text search across verbatim transcripts"

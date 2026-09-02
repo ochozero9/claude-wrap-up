@@ -1,11 +1,10 @@
 ---
-description: Create a structured diary entry from the current session transcript
-model: claude-sonnet-4-6
+description: Create a structured diary entry from the current agent session
 ---
 
 # Create Diary Entry from Current Session
 
-You are going to create a structured diary entry that documents what happened in the current Claude Code session. This entry will be used later for reflection and pattern identification.
+Create a structured diary entry that documents what happened in the current session. This entry can be used later for reflection and pattern identification.
 
 ## Approach: Context-First Strategy
 
@@ -36,13 +35,13 @@ Skip to Step 4 to write the diary entry.
 If you determine context is insufficient, run this command to find the transcript:
 
 ```bash
-# Find the most recent session file for this project
+# Find a recent session file for this project
 # NOTE: Path format includes leading dash: -Users-name-Code-app
-SESSION_FILE=$(ls -t ~/.claude/projects/-$(echo "{{ cwd }}" | sed 's/\//‐/g')/*.jsonl 2>/dev/null | head -1) && \
+SESSION_FILE=$(find "${WRAP_UP_TRANSCRIPT_DIR:-$HOME/.config/agent-wrap-up/transcripts}" -name '*.jsonl' -type f -print 2>/dev/null | head -1) && \
 if [ -z "$SESSION_FILE" ]; then \
   echo "ERROR: No session file found" && \
-  echo "Looking in: ~/.claude/projects/-$(echo "{{ cwd }}" | sed 's/\//‐/g')/" && \
-  ls -la ~/.claude/projects/ | head -20; \
+  echo "Looking in: ${WRAP_UP_TRANSCRIPT_DIR:-$HOME/.config/agent-wrap-up/transcripts}" && \
+  ls -la "${WRAP_UP_TRANSCRIPT_DIR:-$HOME/.config/agent-wrap-up/transcripts}" 2>/dev/null | head -20; \
 else \
   echo "FOUND: $SESSION_FILE" && \
   ls -lh "$SESSION_FILE"; \
@@ -153,12 +152,12 @@ Run this command to save the entry:
 
 ```bash
 # Create directory if needed
-mkdir -p ~/.claude/diary/entries && \
+mkdir -p "${WRAP_UP_DIARY_DIR:-$HOME/.local/share/agent-wrap-up/diary}/entries" && \
 # Determine filename
 TODAY=$(date +%Y-%m-%d) && \
 N=1 && \
-while [ -f ~/.claude/diary/entries/${TODAY}-session-${N}.md ]; do N=$((N+1)); done && \
-DIARY_FILE=~/.claude/diary/entries/${TODAY}-session-${N}.md && \
+while [ -f "${WRAP_UP_DIARY_DIR:-$HOME/.local/share/agent-wrap-up/diary}/entries/${TODAY}-session-${N}.md" ]; do N=$((N+1)); done && \
+DIARY_FILE="${WRAP_UP_DIARY_DIR:-$HOME/.local/share/agent-wrap-up/diary}/entries/${TODAY}-session-${N}.md" && \
 # Save entry (you'll need to write the content)
 echo "[diary-content]" > "$DIARY_FILE" && \
 echo "Saved to: $DIARY_FILE"
@@ -199,5 +198,5 @@ Display:
 
 **JSONL-based errors:**
 - If session file not found, show where you looked (remember: `-Users-...` format with leading dash)
-- Check `ls -la ~/.claude/projects/` to help diagnose path issues
+- Check the configured transcript directory to help diagnose path issues
 - If transcript is malformed, document what you could parse and fall back to context

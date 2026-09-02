@@ -1,3 +1,9 @@
 .DS_Store
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+*.jsonl
+*.log
+.env
+.env.*

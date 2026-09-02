@@ -2,7 +2,7 @@
 """
 ingest.py — load verbatim Claude Code transcripts into the messages table.
 
-Reads Claude Code session JSONL logs (~/.claude/projects/<proj>/<session>.jsonl)
+Reads compatible session JSONL logs from the configured source directory.
 and inserts each user/assistant turn as a row in `messages`. Idempotent: the
 UNIQUE index on messages.uuid means re-running only adds new turns.
 
@@ -10,7 +10,7 @@ Usage:
     ingest.py <transcripts_db> <conversations_db> [path]
         transcripts_db   — target DB for the messages table
         conversations_db — summary ledger, attached read-only for best-effort linkage
-        path             — defaults to ~/.claude/projects; may be a .jsonl file or a dir
+        path             — defaults to WRAP_UP_TRANSCRIPT_DIR; may be a .jsonl file or a dir
 
 Notes:
 - Subagent / sidechain transcripts are skipped by default — the table holds the
@@ -24,7 +24,10 @@ import sqlite3
 import sys
 
 HOME = os.path.expanduser("~")
-DEFAULT_SCAN = os.path.join(HOME, ".claude", "projects")
+DEFAULT_SCAN = os.environ.get(
+    "WRAP_UP_TRANSCRIPT_DIR",
+    os.path.join(HOME, ".config", "agent-wrap-up", "transcripts"),
+)
 
 
 def flatten(content):
